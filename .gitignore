@@ -1,0 +1,5 @@
+.build/
+AppVolume.app/
+.DS_Store
+*.xcodeproj/
+DerivedData/
