@@ -14,9 +14,9 @@ swift build -c release
 
 BIN_PATH="$(swift build -c release --show-bin-path)/$BIN_NAME"
 
-echo "==> Assembling $BUNDLE…"
+echo "==> Assembling ${BUNDLE}…"
 rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+mkdir -p "$BUNDLE/Contents/MacOS"
 cp "$BIN_PATH" "$BUNDLE/Contents/MacOS/$BIN_NAME"
 cp Info.plist "$BUNDLE/Contents/Info.plist"
 

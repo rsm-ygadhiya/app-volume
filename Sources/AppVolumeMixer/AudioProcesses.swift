@@ -3,42 +3,16 @@ import AppKit
 import Darwin
 
 /// A process known to the audio system, resolved to a human-friendly app.
-struct AudioProcessInfo: Identifiable, Equatable {
+struct AudioProcessInfo: Identifiable {
     let id: AudioObjectID   // Core Audio process-object id (what taps expect)
     let pid: pid_t
-    let bundleID: String?
-    var name: String
-    var isPlaying: Bool
-
-    static func == (lhs: AudioProcessInfo, rhs: AudioProcessInfo) -> Bool {
-        lhs.id == rhs.id && lhs.isPlaying == rhs.isPlaying && lhs.name == rhs.name
-    }
+    let name: String
 }
 
-@available(macOS 14.4, *)
 enum AudioProcessEnumerator {
-
-    /// All process objects currently registered with the HAL.
-    static func allProcessObjects() -> [AudioObjectID] {
-        CA.array(CA.systemObject, kAudioHardwarePropertyProcessObjectList, of: AudioObjectID.self)
-    }
-
-    static func pid(of processObject: AudioObjectID) -> pid_t {
-        CA.scalar(processObject, kAudioProcessPropertyPID, default: pid_t(-1))
-    }
-
-    static func bundleID(of processObject: AudioObjectID) -> String? {
-        CA.string(processObject, kAudioProcessPropertyBundleID)
-    }
-
-    /// True while the process is actively producing output audio.
-    static func isRunningOutput(_ processObject: AudioObjectID) -> Bool {
-        CA.scalar(processObject, kAudioProcessPropertyIsRunningOutput, default: UInt32(0)) != 0
-    }
 
     // MARK: - Name resolution (walk helper -> owning app)
 
-    /// Parent pid of a process, via sysctl.
     private static func parentPID(of pid: pid_t) -> pid_t? {
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride
@@ -63,11 +37,10 @@ enum AudioProcessEnumerator {
                 return app
             }
             let parent = parentPID(of: p)
-            if parent == nil || parent == p || parent == 0 || parent == 1 { break }
+            if parent == nil || parent == p || parent == 1 { break }
             current = parent
             hops += 1
         }
-        // Fall back to whatever app object matches the original pid, if any.
         return NSRunningApplication(processIdentifier: pid)
     }
 
@@ -96,20 +69,22 @@ enum AudioProcessEnumerator {
     static func currentAudioApps() -> [AudioProcessInfo] {
         var byOwner: [pid_t: AudioProcessInfo] = [:]   // keyed by owning-app pid
 
-        for obj in allProcessObjects() {
-            let processPID = pid(of: obj)
-            guard processPID > 0, isRunningOutput(obj) else { continue }
+        let processObjects = CA.array(CA.systemObject, kAudioHardwarePropertyProcessObjectList,
+                                      of: AudioObjectID.self)
+        for obj in processObjects {
+            let processPID = CA.scalar(obj, kAudioProcessPropertyPID, default: pid_t(-1))
+            guard processPID > 0,
+                  CA.scalar(obj, kAudioProcessPropertyIsRunningOutput, default: UInt32(0)) != 0
+            else { continue }
 
-            let bundle = bundleID(of: obj)
-            let owner = owningApp(for: processPID)
-            let key = owner?.processIdentifier ?? processPID
-            let name = displayName(pid: processPID, bundleID: bundle)
+            let key = owningApp(for: processPID)?.processIdentifier ?? processPID
 
             // Keep one entry per owning app; the tap still targets the specific
             // audio-producing process object (obj), which is what we store as id.
             if byOwner[key] == nil {
+                let bundleID = CA.string(obj, kAudioProcessPropertyBundleID)
                 byOwner[key] = AudioProcessInfo(id: obj, pid: processPID,
-                                                bundleID: bundle, name: name, isPlaying: true)
+                                                name: displayName(pid: processPID, bundleID: bundleID))
             }
         }
 

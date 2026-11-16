@@ -1,33 +1,29 @@
 import CoreAudio
 import Foundation
 
-// MARK: - Low level Core Audio property helpers
-//
-// These wrap the verbose AudioObjectGetPropertyData / SetPropertyData calls
-// into small typed helpers so the engine code below stays readable.
-
+/// Typed readers for Core Audio object properties (global scope, main element).
 enum CA {
 
-    /// Read a fixed-size scalar property (Int32, UInt32, AudioObjectID, ...).
+    private static func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector,
+                                   mScope: kAudioObjectPropertyScopeGlobal,
+                                   mElement: kAudioObjectPropertyElementMain)
+    }
+
     static func scalar<T>(_ object: AudioObjectID,
                           _ selector: AudioObjectPropertySelector,
-                          scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
-                          element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain,
                           default def: T) -> T {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
+        var address = address(selector)
         var value = def
         var size = UInt32(MemoryLayout<T>.size)
         let status = AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
         return status == noErr ? value : def
     }
 
-    /// Read an array-valued property (e.g. the process object list).
     static func array<T>(_ object: AudioObjectID,
                          _ selector: AudioObjectPropertySelector,
-                         scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
-                         element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain,
                          of type: T.Type) -> [T] {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
+        var address = address(selector)
         var dataSize: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(object, &address, 0, nil, &dataSize) == noErr, dataSize > 0 else {
             return []
@@ -43,12 +39,9 @@ enum CA {
         return Array(UnsafeBufferPointer(start: typed, count: count))
     }
 
-    /// Read a CFString-valued property (bundle id, UID, ...).
     static func string(_ object: AudioObjectID,
-                       _ selector: AudioObjectPropertySelector,
-                       scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
-                       element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> String? {
-        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
+                       _ selector: AudioObjectPropertySelector) -> String? {
+        var address = address(selector)
         var value: CFString? = nil
         var size = UInt32(MemoryLayout<CFString?>.size)
         let status = withUnsafeMutablePointer(to: &value) { ptr -> OSStatus in
@@ -60,12 +53,10 @@ enum CA {
 
     static var systemObject: AudioObjectID { AudioObjectID(kAudioObjectSystemObject) }
 
-    /// The user's current default output device object id.
     static var defaultOutputDevice: AudioObjectID {
         scalar(systemObject, kAudioHardwarePropertyDefaultOutputDevice, default: AudioObjectID(0))
     }
 
-    /// UID string for a device object.
     static func deviceUID(_ device: AudioObjectID) -> String? {
         string(device, kAudioDevicePropertyDeviceUID)
     }

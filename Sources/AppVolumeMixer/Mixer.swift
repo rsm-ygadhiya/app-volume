@@ -4,23 +4,32 @@ import AVFoundation
 
 /// Top-level view model. Tracks which apps are playing audio and owns one
 /// `AppVolumeController` per app the user has turned away from 100%.
-@available(macOS 14.4, *)
 @MainActor
 final class Mixer: ObservableObject {
 
-    @Published private(set) var apps: [AudioProcessInfo] = []
-    /// Volume per pid, 0.0...1.5 (100% = untouched / native passthrough).
-    @Published var volumes: [pid_t: Float] = [:]
-    @Published var errors: [pid_t: String] = [:]
-    /// Microphone/audio-capture permission — process taps are gated by it.
-    @Published var authStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+    /// Everything the mixer knows about one app, keyed by pid in `states`.
+    private struct AppState {
+        /// 0.0...`maxVolume`; `unity` means untouched / native passthrough.
+        var volume: Float = Mixer.unity
+        /// Present only while the app is routed through us.
+        var controller: AppVolumeController?
+        var error: String?
+    }
 
-    private var controllers: [pid_t: AppVolumeController] = [:]
+    @Published private(set) var apps: [AudioProcessInfo] = []
+    @Published private var states: [pid_t: AppState] = [:]
+    /// Microphone/audio-capture permission — process taps are gated by it.
+    @Published private var authStatus: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
+
     private var refreshTimer: Timer?
 
-    static let maxVolume: Float = 1.5   // allow up to 150% boost
+    nonisolated static let unity: Float = 1.0
+    nonisolated static let maxVolume: Float = 1.5
 
     var isAuthorized: Bool { authStatus == .authorized }
+
+    func volume(for pid: pid_t) -> Float { states[pid]?.volume ?? Self.unity }
+    func error(for pid: pid_t) -> String? { states[pid]?.error }
 
     /// Ask for audio-capture permission. Triggers the system prompt the first
     /// time and registers the app in Privacy & Security afterwards.
@@ -48,54 +57,50 @@ final class Mixer: ObservableObject {
         }
     }
 
-    /// Re-scan the audio process list; keep controllers for apps still alive.
+    /// Re-scan the audio process list. A controlled app that is no longer
+    /// outputting audio loses its controller and its state.
     func refresh() {
         let current = AudioProcessEnumerator.currentAudioApps()
         apps = current
 
         let livePIDs = Set(current.map(\.pid))
-        for pid in controllers.keys where !livePIDs.contains(pid) {
-            controllers[pid]?.stop()
-            controllers[pid] = nil
-            volumes[pid] = nil
-            errors[pid] = nil
+        for (pid, state) in states where state.controller != nil && !livePIDs.contains(pid) {
+            states[pid] = nil
         }
-        // Default any newly-seen app to 100%.
-        for app in current where volumes[app.pid] == nil {
-            volumes[app.pid] = 1.0
+        for app in current where states[app.pid] == nil {
+            states[app.pid] = AppState()
         }
     }
 
-    func icon(for pid: pid_t) -> NSImage? {
-        AudioProcessEnumerator.icon(for: pid)
-    }
-
-    /// Apply a new volume to an app, creating or tearing down its controller.
+    /// Apply a new volume to an app, creating or releasing its controller.
     func setVolume(_ value: Float, for app: AudioProcessInfo) {
         let clamped = min(max(value, 0), Self.maxVolume)
-        volumes[app.pid] = clamped
+        var state = states[app.pid] ?? AppState()
+        state.volume = clamped
+        defer { states[app.pid] = state }
 
         // Within 1% of unity -> native passthrough, no tap needed.
-        if abs(clamped - 1.0) < 0.01 {
-            controllers[app.pid]?.stop()
-            controllers[app.pid] = nil
-            errors[app.pid] = nil
+        if abs(clamped - Self.unity) < 0.01 {
+            state.controller = nil
+            state.error = nil
             return
         }
 
-        if let controller = controllers[app.pid] {
-            controller.gain = clamped
-        } else {
-            let controller = AppVolumeController(pid: app.pid,
-                                                 processObject: app.id,
-                                                 initialGain: clamped)
-            if controller.start() {
-                controllers[app.pid] = controller
-                errors[app.pid] = nil
-                scheduleSilentCaptureCheck(for: app.pid)
-            } else {
-                errors[app.pid] = controller.lastError ?? "Failed to start"
-            }
+        if let controller = state.controller {
+            controller.setGain(clamped)
+            return
+        }
+
+        do {
+            state.controller = try AppVolumeController(pid: app.pid,
+                                                       processObject: app.id,
+                                                       initialGain: clamped)
+            state.error = nil
+            scheduleSilentCaptureCheck(for: app.pid)
+        } catch let error as AppVolumeController.StartError {
+            state.error = error.message
+        } catch {
+            state.error = "Failed to start"
         }
     }
 
@@ -104,30 +109,30 @@ final class Mixer: ObservableObject {
     private func scheduleSilentCaptureCheck(for pid: pid_t) {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard let controller = controllers[pid], controller.isActive else { return }
+            guard let controller = states[pid]?.controller else { return }
             if controller.consumePeak() == 0 {
                 if !isAuthorized {
-                    errors[pid] = "No audio captured — grant Microphone permission to AppVolume, then quit & reopen."
+                    states[pid]?.error = "No audio captured — grant Microphone permission to AppVolume, then quit & reopen."
                 } else {
-                    errors[pid] = "No audio from this app (it may be paused)."
+                    states[pid]?.error = "No audio from this app (it may be paused)."
                 }
             } else {
-                errors[pid] = nil
+                states[pid]?.error = nil
             }
         }
     }
 
     func resetAll() {
-        for (_, controller) in controllers { controller.stop() }
-        controllers.removeAll()
-        for key in volumes.keys { volumes[key] = 1.0 }
-        errors.removeAll()
+        for pid in states.keys {
+            states[pid] = AppState()
+        }
     }
 
     func shutdown() {
         refreshTimer?.invalidate()
         refreshTimer = nil
-        for (_, controller) in controllers { controller.stop() }
-        controllers.removeAll()
+        for pid in states.keys {
+            states[pid]?.controller = nil
+        }
     }
 }

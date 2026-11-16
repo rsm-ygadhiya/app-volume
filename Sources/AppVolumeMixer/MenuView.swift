@@ -1,6 +1,5 @@
 import SwiftUI
 
-@available(macOS 14.4, *)
 struct MenuView: View {
     @ObservedObject var mixer: Mixer
 
@@ -76,14 +75,13 @@ struct MenuView: View {
     }
 }
 
-@available(macOS 14.4, *)
 private struct AppRow: View {
     @ObservedObject var mixer: Mixer
     let app: AudioProcessInfo
 
     private var volume: Binding<Double> {
         Binding(
-            get: { Double(mixer.volumes[app.pid] ?? 1.0) },
+            get: { Double(mixer.volume(for: app.pid)) },
             set: { mixer.setVolume(Float($0), for: app) }
         )
     }
@@ -91,7 +89,7 @@ private struct AppRow: View {
     var body: some View {
         VStack(spacing: 2) {
             HStack(spacing: 8) {
-                if let icon = mixer.icon(for: app.pid) {
+                if let icon = AudioProcessEnumerator.icon(for: app.pid) {
                     Image(nsImage: icon)
                         .resizable()
                         .frame(width: 20, height: 20)
@@ -101,7 +99,7 @@ private struct AppRow: View {
                 }
                 Text(app.name).lineLimit(1)
                 Spacer()
-                Text("\(Int((mixer.volumes[app.pid] ?? 1.0) * 100))%")
+                Text("\(Int(mixer.volume(for: app.pid) * 100))%")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -112,7 +110,7 @@ private struct AppRow: View {
                 Image(systemName: "speaker.wave.3.fill").font(.caption2).foregroundStyle(.secondary)
             }
 
-            if let err = mixer.errors[app.pid] {
+            if let err = mixer.error(for: app.pid) {
                 Text(err)
                     .font(.caption2)
                     .foregroundStyle(.red)

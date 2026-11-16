@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "AppVolumeMixer",
     platforms: [
-        .macOS(.v14) // Core Audio process taps require macOS 14.4+
+        .macOS("14.4") // Core Audio process taps
     ],
     targets: [
         .executableTarget(

@@ -3,23 +3,27 @@ import Foundation
 import os
 
 /// Owns one process tap + one private aggregate device for a single app, and
-/// re-renders that app's audio to the real output device scaled by `gain`.
+/// re-renders that app's audio to the real output device scaled by the gain.
 ///
-/// Lifecycle: created lazily the moment an app is turned away from 100%, and
-/// torn down when it returns to 100% (so untouched apps play natively and are
-/// never routed through us).
-@available(macOS 14.4, *)
+/// A controller that exists is rendering: `init` builds and starts the whole
+/// chain or throws, and `deinit` tears it down. It is created the moment an app
+/// is turned away from 100% and released when it returns to 100%, so untouched
+/// apps play natively and are never routed through us.
 final class AppVolumeController {
 
-    let pid: pid_t
-    private let processObject: AudioObjectID
+    /// Why the chain could not be built (surfaced in the UI).
+    struct StartError: Error {
+        let message: String
+    }
+
+    private let pid: pid_t
 
     private var tapID: AudioObjectID = 0
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
 
-    /// Realtime-read gain. Heap-allocated so the audio callback reads a stable
-    /// address without touching Swift ARC / the owning object.
+    /// Heap-allocated so the realtime audio callback reads a stable address
+    /// without touching Swift ARC / the owning object.
     private let gainPtr: UnsafeMutablePointer<Float>
 
     /// Peak |input sample| observed by the IO callback (for silent-capture
@@ -28,21 +32,27 @@ final class AppVolumeController {
 
     private static let log = Logger(subsystem: "AppVolumeMixer", category: "controller")
 
-    /// Non-nil message if setup failed (surfaced in the UI).
-    private(set) var lastError: String?
-
-    init(pid: pid_t, processObject: AudioObjectID, initialGain: Float) {
+    init(pid: pid_t, processObject: AudioObjectID, initialGain: Float) throws {
         self.pid = pid
-        self.processObject = processObject
         self.gainPtr = .allocate(capacity: 1)
         self.gainPtr.initialize(to: initialGain)
         self.peakPtr = .allocate(capacity: 1)
         self.peakPtr.initialize(to: 0)
+
+        // Every stored property is set, so a throw from here on runs `deinit`,
+        // which is the single teardown path for a partly built chain.
+        do {
+            try start(processObject: processObject)
+        } catch let error as StartError {
+            Self.log.error("pid \(pid): \(error.message)")
+            throw error
+        }
+        Self.log.info("Started volume control for pid \(pid)")
     }
 
-    var gain: Float {
-        get { gainPtr.pointee }
-        set { gainPtr.pointee = max(0, newValue) }
+    /// The caller is responsible for keeping this within its allowed range.
+    func setGain(_ value: Float) {
+        gainPtr.pointee = value
     }
 
     /// Read and reset the peak input level seen since the last call.
@@ -52,45 +62,29 @@ final class AppVolumeController {
         return v
     }
 
-    var isActive: Bool { aggregateID != 0 && ioProcID != nil }
-
-    // MARK: - Start
-
-    /// Build tap -> aggregate -> IOProc and start rendering. Returns false on failure.
-    @discardableResult
-    func start() -> Bool {
-        guard !isActive else { return true }
-
-        // 1. Create a private tap that mutes the app's own output and hands the
-        //    samples to us instead.
+    private func start(processObject: AudioObjectID) throws {
         let desc = CATapDescription(stereoMixdownOfProcesses: [processObject])
         desc.name = "AppVolume tap \(pid)"
         desc.isPrivate = true
+        // The tap silences the app's own output and hands the samples to us.
         desc.muteBehavior = .mutedWhenTapped
 
         var newTap: AudioObjectID = 0
         var status = AudioHardwareCreateProcessTap(desc, &newTap)
         guard status == noErr, newTap != 0 else {
-            fail("Could not create audio tap (status \(status)). Grant audio-recording permission in System Settings › Privacy & Security.")
-            return false
+            throw StartError(message: "Could not create audio tap (status \(status)). Grant audio-recording permission in System Settings › Privacy & Security.")
         }
         tapID = newTap
 
         guard let tapUID = CA.string(tapID, kAudioTapPropertyUID) else {
-            fail("Could not read tap UID.")
-            stop()
-            return false
+            throw StartError(message: "Could not read tap UID.")
         }
 
-        // 2. Resolve the real output device we will render into.
         let outputDevice = CA.defaultOutputDevice
         guard outputDevice != 0, let outputUID = CA.deviceUID(outputDevice) else {
-            fail("No default output device.")
-            stop()
-            return false
+            throw StartError(message: "No default output device.")
         }
 
-        // 3. Wrap tap + output device into a private aggregate device.
         let aggUID = "com.appvolume.agg.\(pid).\(tapUID)"
         let description: [String: Any] = [
             kAudioAggregateDeviceNameKey: "AppVolume \(pid)",
@@ -113,14 +107,10 @@ final class AppVolumeController {
         var newAgg: AudioObjectID = 0
         status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &newAgg)
         guard status == noErr, newAgg != 0 else {
-            fail("Could not create aggregate device (status \(status)).")
-            stop()
-            return false
+            throw StartError(message: "Could not create aggregate device (status \(status)).")
         }
         aggregateID = newAgg
 
-        // 4. Install a realtime IO block: copy the tapped audio to the output
-        //    buffers, scaled by the current gain.
         let gainPtr = self.gainPtr
         let peakPtr = self.peakPtr
         let block: AudioDeviceIOBlock = { _, inInputData, _, outOutputData, _ in
@@ -146,7 +136,6 @@ final class AppVolumeController {
                         dst[s] = v * gain
                         s += 1
                     }
-                    // Zero any trailing bytes the input didn't cover.
                     let copied = samples * MemoryLayout<Float>.size
                     if copied < Int(out.mDataByteSize) {
                         memset(outData + copied, 0, Int(out.mDataByteSize) - copied)
@@ -161,50 +150,27 @@ final class AppVolumeController {
         var newProc: AudioDeviceIOProcID?
         status = AudioDeviceCreateIOProcIDWithBlock(&newProc, aggregateID, nil, block)
         guard status == noErr, let proc = newProc else {
-            fail("Could not create IO proc (status \(status)).")
-            stop()
-            return false
+            throw StartError(message: "Could not create IO proc (status \(status)).")
         }
         ioProcID = proc
 
         status = AudioDeviceStart(aggregateID, proc)
         guard status == noErr else {
-            fail("Could not start audio device (status \(status)).")
-            stop()
-            return false
+            throw StartError(message: "Could not start audio device (status \(status)).")
         }
-
-        lastError = nil
-        Self.log.info("Started volume control for pid \(self.pid)")
-        return true
     }
 
-    // MARK: - Stop / teardown
-
-    func stop() {
+    deinit {
         if let proc = ioProcID, aggregateID != 0 {
             AudioDeviceStop(aggregateID, proc)
             AudioDeviceDestroyIOProcID(aggregateID, proc)
         }
-        ioProcID = nil
-
         if aggregateID != 0 {
             AudioHardwareDestroyAggregateDevice(aggregateID)
-            aggregateID = 0
         }
         if tapID != 0 {
             AudioHardwareDestroyProcessTap(tapID)
-            tapID = 0
         }
-    }
-
-    private func fail(_ message: String) {
-        lastError = message
-        Self.log.error("pid \(self.pid): \(message)")
-    }
-
-    deinit {
-        stop()
         gainPtr.deinitialize(count: 1)
         gainPtr.deallocate()
         peakPtr.deinitialize(count: 1)

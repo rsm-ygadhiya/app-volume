@@ -4,7 +4,6 @@ import SwiftUI
 // Menu-bar (accessory) app. No Dock icon, no main window — just a status item
 // that shows a popover with a slider per audio-playing app.
 
-@available(macOS 14.4, *)
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -43,20 +42,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@available(macOS 14.4, *)
-@MainActor
-func launch() {
+// Top-level code runs on the main thread, but Swift 5 mode does not treat it
+// as main-actor isolated.
+MainActor.assumeIsolated {
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate
     app.setActivationPolicy(.accessory)
     app.run()
-}
-
-if #available(macOS 14.4, *) {
-    // Program entry runs on the main thread; assert that for the compiler.
-    MainActor.assumeIsolated { launch() }
-} else {
-    fputs("AppVolumeMixer requires macOS 14.4 or newer (Core Audio process taps).\n", stderr)
-    exit(1)
 }
